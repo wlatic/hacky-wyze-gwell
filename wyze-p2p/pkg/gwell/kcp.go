@@ -113,8 +113,12 @@ type KCPConn struct {
 	// Encoding buffer
 	buffer []byte
 
-	// Logging
-	LogPrefix string
+	// Diagnostics
+	retransmits  uint32 // total retransmit count
+	snDropOld    uint32 // segments dropped: SN < rcvNxt
+	snDropAhead  uint32 // segments dropped: SN >= rcvNxt + rcvWnd
+	lastDropSN   uint32 // last dropped SN (for diagnostics)
+	LogPrefix    string
 }
 
 // NewKCPConn creates a new KCP connection with the given conv ID and output callback.
@@ -279,7 +283,15 @@ func (kcp *KCPConn) Input(data []byte) int {
 						copy(seg.data, data[:length])
 					}
 					kcp.parseData(seg)
+				} else {
+					// SN < rcvNxt — old/duplicate segment
+					kcp.snDropOld++
+					kcp.lastDropSN = sn
 				}
+			} else {
+				// SN >= rcvNxt + rcvWnd — too far ahead
+				kcp.snDropAhead++
+				kcp.lastDropSN = sn
 			}
 
 		case IKCP_CMD_WASK:
@@ -663,6 +675,7 @@ func (kcp *KCPConn) flushLocked() {
 			// Timeout retransmission
 			needSend = true
 			segment.xmit++
+			kcp.retransmits++
 			if kcp.nodelay == 0 {
 				segment.rto += uint32(kcp.rxRto)
 			} else {
@@ -674,6 +687,7 @@ func (kcp *KCPConn) flushLocked() {
 			// Fast retransmission
 			needSend = true
 			segment.xmit++
+			kcp.retransmits++
 			segment.fastack = 0
 			segment.resendts = current + segment.rto
 			change = true
@@ -764,6 +778,10 @@ type KCPStats struct {
 	RmtWnd      uint32
 	CWnd        uint32
 	RcvWnd      uint32
+	Retransmits uint32
+	SNDropOld   uint32
+	SNDropAhead uint32
+	LastDropSN  uint32
 }
 
 // Stats returns a snapshot of internal KCP state for diagnostics.
@@ -782,6 +800,10 @@ func (kcp *KCPConn) Stats() KCPStats {
 		RmtWnd:      kcp.rmtWnd,
 		CWnd:        kcp.cwnd,
 		RcvWnd:      kcp.rcvWnd,
+		Retransmits: kcp.retransmits,
+		SNDropOld:   kcp.snDropOld,
+		SNDropAhead: kcp.snDropAhead,
+		LastDropSN:  kcp.lastDropSN,
 	}
 }
 

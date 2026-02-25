@@ -159,6 +159,12 @@ type Session struct {
 	bestLanAddr     *net.UDPAddr // best LAN address for KCP output (camera's actual IP:port)
 	meterRound      uint32       // per-session meter probe round counter
 
+	// Diagnostics
+	rawUDPPkts      int64     // total raw UDP packets received during streaming
+	lastMeterRecv   time.Time // last time we received any meter frame (REQ or ACK)
+	meterReqCount   int       // incoming meter REQUESTs from camera (since last log)
+	meterAckCount   int       // incoming meter ACKs from camera (since last log)
+
 	// Lifecycle
 	state  SessionState
 	closed int32
@@ -1178,8 +1184,10 @@ func (s *Session) streamLoop() error {
 	s.ctrlKCP = NewKCPConn(s.convCtrl, kcpOutputFn)
 	s.dataKCP.NoDelay(0, 5, 10, 1)
 	s.ctrlKCP.NoDelay(0, 5, 10, 1)
-	s.dataKCP.SetWndSize(64, 64)
-	s.ctrlKCP.SetWndSize(64, 64)
+	s.dataKCP.SetWndSize(64, 512)
+	s.ctrlKCP.SetWndSize(64, 128)
+	s.dataKCP.LogPrefix = s.prefix + " DATA"
+	s.ctrlKCP.LogPrefix = s.prefix + " CTRL"
 
 	// KCP update goroutine
 	kcpDone := make(chan struct{})
@@ -1339,8 +1347,8 @@ func (s *Session) streamLoop() error {
 	lastMeterProbe := time.Now()
 
 	for !s.isClosed() {
-		// Heartbeat every 5 seconds
-		if time.Since(lastHeartbeat) > 5*time.Second {
+		// Heartbeat every 40 seconds (SDK uses 35-50s)
+		if time.Since(lastHeartbeat) > 40*time.Second {
 			hb := BuildHeartbeat(token, s.routingSessionID, s.nextSqnum(), result.SessionKey, s.pwdKey)
 			pc.WriteToUDP(hb, s.serverUDPAddr)
 			lastHeartbeat = time.Now()
@@ -1354,9 +1362,6 @@ func (s *Session) streamLoop() error {
 			probe := BuildMeterProbe(s.linkID, token.AccessID, s.targetDev.TID, s.meterRound)
 			probeFrame := BuildMTPFrame(probe, true)
 			s.sendMTP(probeFrame)
-			if s.meterRound == 1 {
-				log.Printf("%s METER PROBE hex (68 bytes): %x", s.prefix, probe)
-			}
 			if s.meterRound%15 == 0 {
 				log.Printf("%s meter probe round=%d", s.prefix, s.meterRound)
 			}
@@ -1372,10 +1377,23 @@ func (s *Session) streamLoop() error {
 			lastOnlineSocket = time.Now()
 		}
 
-		// Status log every 30 seconds
+		// Status log every 30 seconds — enhanced with KCP diagnostics
 		if time.Since(lastStatus) > 30*time.Second {
-			LogMTPStats(s.prefix, s.dataKCP, s.ctrlKCP, s.streamPkts, s.streamDataBytes)
-			log.Printf("%s LAN addrs: %d, bestLAN: %v, last data from: %s", s.prefix, len(s.lanMTPAddrs), s.bestLanAddr, s.lastDataFrom)
+			ds := s.dataKCP.Stats()
+			cs := s.ctrlKCP.Stats()
+			log.Printf("%s STREAM: %d pkts, %d bytes | rawUDP: %d", s.prefix, s.streamPkts, s.streamDataBytes, s.rawUDPPkts)
+			log.Printf("%s  DATA-KCP: rcvNxt=%d rcvQ=%d rcvBuf=%d sndUna=%d sndNxt=%d waitSnd=%d rmtWnd=%d cwnd=%d rexmit=%d dropOld=%d dropAhead=%d lastDropSN=%d",
+				s.prefix, ds.RcvNxt, ds.RcvQueueLen, ds.RcvBufLen, ds.SndUna, ds.SndNxt, ds.SndBufLen+ds.SndQueueLen, ds.RmtWnd, ds.CWnd, ds.Retransmits, ds.SNDropOld, ds.SNDropAhead, ds.LastDropSN)
+			log.Printf("%s  CTRL-KCP: rcvNxt=%d rcvQ=%d rcvBuf=%d sndUna=%d sndNxt=%d waitSnd=%d rmtWnd=%d cwnd=%d rexmit=%d dropOld=%d dropAhead=%d",
+				s.prefix, cs.RcvNxt, cs.RcvQueueLen, cs.RcvBufLen, cs.SndUna, cs.SndNxt, cs.SndBufLen+cs.SndQueueLen, cs.RmtWnd, cs.CWnd, cs.Retransmits, cs.SNDropOld, cs.SNDropAhead)
+			meterAge := "never"
+			if !s.lastMeterRecv.IsZero() {
+				meterAge = fmt.Sprintf("%.1fs ago", time.Since(s.lastMeterRecv).Seconds())
+			}
+			log.Printf("%s  meter: sent=%d recvREQ=%d recvACK=%d lastRecv=%s | bestLAN: %v",
+				s.prefix, s.meterRound, s.meterReqCount, s.meterAckCount, meterAge, s.bestLanAddr)
+			s.meterReqCount = 0
+			s.meterAckCount = 0
 			lastStatus = time.Now()
 		}
 
@@ -1386,6 +1404,7 @@ func (s *Session) streamLoop() error {
 			s.drainKCPRecv()
 			continue
 		}
+		s.rawUDPPkts++
 
 		isFromServer := fromAddr.IP.Equal(s.serverUDPAddr.IP) && fromAddr.Port == s.serverUDPAddr.Port
 
@@ -1409,17 +1428,17 @@ func (s *Session) streamLoop() error {
 				}
 			}
 
-			// Log incoming meter/session control frames for diagnostics
+			// Track incoming meter frames (summarized in 30s status log)
 			{
 				diagOff := MTPPayloadOffset(buf[1])
 				if n >= diagOff+4 && buf[diagOff] == 0x00 {
 					mCmd := buf[diagOff+1]
 					if mCmd == 0x01 {
-						log.Printf("%s INCOMING meter REQUEST from %s: %d bytes, first20=%x",
-							s.prefix, fromAddr, n, buf[diagOff:minInt(diagOff+20, n)])
+						s.meterReqCount++
+						s.lastMeterRecv = time.Now()
 					} else if mCmd == 0x02 {
-						log.Printf("%s INCOMING meter ACK from %s: %d bytes, first20=%x",
-							s.prefix, fromAddr, n, buf[diagOff:minInt(diagOff+20, n)])
+						s.meterAckCount++
+						s.lastMeterRecv = time.Now()
 					}
 				}
 			}
@@ -1458,7 +1477,6 @@ func (s *Session) streamLoop() error {
 			// Handle meter req — camera sent us a meter probe, we respond with ACK
 			if sessCmd == 0x10001 {
 				payOff := MTPPayloadOffset(buf[1])
-				log.Printf("%s sending meter ACK (camera requested) from=%s payOff=%d", s.prefix, fromAddr, payOff)
 				resp := BuildMeterAckFromRequest(buf[payOff:minInt(n, payOff+68)])
 				respFrame := BuildMTPFrame(resp, true)
 				if fromAddr != nil {
@@ -1498,7 +1516,21 @@ func (s *Session) streamLoop() error {
 		}
 	}
 
-	LogMTPStats(s.prefix+" FINAL", s.dataKCP, s.ctrlKCP, s.streamPkts, s.streamDataBytes)
+	// Death diagnostics — log full KCP state when stream ends
+	ds := s.dataKCP.Stats()
+	cs := s.ctrlKCP.Stats()
+	meterAge := "never"
+	if !s.lastMeterRecv.IsZero() {
+		meterAge = fmt.Sprintf("%.1fs ago", time.Since(s.lastMeterRecv).Seconds())
+	}
+	log.Printf("%s STREAM ENDED — death diagnostics:", s.prefix)
+	log.Printf("%s  STREAM: %d pkts, %d bytes | rawUDP: %d", s.prefix, s.streamPkts, s.streamDataBytes, s.rawUDPPkts)
+	log.Printf("%s  DATA-KCP: rcvNxt=%d rcvQ=%d rcvBuf=%d sndUna=%d sndNxt=%d waitSnd=%d rmtWnd=%d cwnd=%d rexmit=%d dropOld=%d dropAhead=%d lastDropSN=%d",
+		s.prefix, ds.RcvNxt, ds.RcvQueueLen, ds.RcvBufLen, ds.SndUna, ds.SndNxt, ds.SndBufLen+ds.SndQueueLen, ds.RmtWnd, ds.CWnd, ds.Retransmits, ds.SNDropOld, ds.SNDropAhead, ds.LastDropSN)
+	log.Printf("%s  CTRL-KCP: rcvNxt=%d rcvQ=%d rcvBuf=%d sndUna=%d sndNxt=%d waitSnd=%d rmtWnd=%d cwnd=%d rexmit=%d dropOld=%d dropAhead=%d",
+		s.prefix, cs.RcvNxt, cs.RcvQueueLen, cs.RcvBufLen, cs.SndUna, cs.SndNxt, cs.SndBufLen+cs.SndQueueLen, cs.RmtWnd, cs.CWnd, cs.Retransmits, cs.SNDropOld, cs.SNDropAhead)
+	log.Printf("%s  meter: sent=%d lastRecv=%s | bestLAN: %v | lastDataFrom: %s",
+		s.prefix, s.meterRound, meterAge, s.bestLanAddr, s.lastDataFrom)
 	return nil
 }
 
@@ -1527,6 +1559,31 @@ func (s *Session) drainKCPRecv() {
 			if len(data) >= 4 {
 				log.Printf("%s CTRL-KCP recv: type=0x%02X len=%d first8=%x",
 					s.prefix, data[0], len(data), data[:minInt(8, len(data))])
+			}
+			// Parse AVSTREAMCTL messages (type=0x03)
+			if len(data) >= 12 && data[0] == 0x03 {
+				avAction := binary.LittleEndian.Uint32(data[8:12])
+				avActionName := fmt.Sprintf("0x%X", avAction)
+				switch avAction {
+				case 1:
+					avActionName = "INITREQ"
+				case 2:
+					avActionName = "ACCEPT"
+				case 3:
+					avActionName = "REJECT"
+				case 4:
+					avActionName = "STOP"
+				case 5:
+					avActionName = "CLOSE"
+				case 6:
+					avActionName = "START"
+				}
+				reason := uint32(0)
+				if len(data) >= 16 {
+					reason = binary.LittleEndian.Uint32(data[12:16])
+				}
+				log.Printf("%s AVSTREAMCTL on CTRL: action=%s(%d) reason=%d len=%d hex=%x",
+					s.prefix, avActionName, avAction, reason, len(data), data[:minInt(len(data), 40)])
 			}
 			DecryptMTPPayload(data, s.mtpRC5Ctx, "CTRL")
 		}
