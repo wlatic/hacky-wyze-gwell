@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+wyze_sdk
+requests
+python-multipart
+# wyze_sdk dependencies are handled automatically, but listing here for completeness if needed

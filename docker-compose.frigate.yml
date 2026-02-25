@@ -1,0 +1,124 @@
+# Full stack deployment: wyze-gwell-bridge (GW cameras) + Wyze Bridge (non-GW) + Frigate NVR
+#
+# All services get LAN IPs via macvlan for direct camera access.
+# Configuration: copy .env.example to .env and set your values.
+#
+# Usage:
+#   docker compose -f docker-compose.frigate.yml up -d --build
+#
+# Stream sources:
+#   GW cameras (OG, Doorbell Pro) → wyze-p2p → rtsp://MEDIAMTX_IP:8554/live/<name>
+#   Non-GW cameras (V3, Pan, etc) → Wyze Bridge → rtsp://WYZE_BRIDGE_IP:8554/<name>
+#   All cameras → Frigate for recording/detection
+
+networks:
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: ${LAN_INTERFACE:-ens18}
+    ipam:
+      config:
+        - subnet: ${LAN_SUBNET:-10.10.0.0/16}
+          gateway: ${LAN_GATEWAY:-10.10.0.1}
+          ip_range: ${LAN_IP_RANGE:-10.10.20.208/29}
+  internal:
+    driver: bridge
+
+services:
+  # =========================================
+  # Frigate NVR — recording + AI detection
+  # =========================================
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: frigate
+    restart: unless-stopped
+    networks:
+      lan:
+        ipv4_address: ${FRIGATE_IP:-10.10.20.210}
+    volumes:
+      - ./frigate/config:/config
+      - ./frigate/storage:/media/frigate
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 1000000000
+    environment:
+      FRIGATE_RTSP_PASSWORD: ""
+    # Uncomment if using Coral USB accelerator:
+    # devices:
+    #   - /dev/bus/usb:/dev/bus/usb
+    # Uncomment if using Intel GPU for hardware acceleration:
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    privileged: true
+
+  # =========================================
+  # docker-wyze-bridge — non-GW Wyze cameras
+  # (V3, V2, Pan, Outdoor, Floodlight, etc)
+  # =========================================
+  wyze-bridge:
+    image: mrlt8/wyze-bridge:latest
+    container_name: wyze-bridge
+    restart: unless-stopped
+    networks:
+      lan:
+        ipv4_address: ${WYZE_BRIDGE_IP:-10.10.20.211}
+    environment:
+      WB_AUTH: "false"
+      WYZE_EMAIL: ${WYZE_EMAIL}
+      WYZE_PASSWORD: ${WYZE_PASSWORD}
+      API_ID: ${WYZE_KEY_ID}
+      API_KEY: ${WYZE_API_KEY}
+      QUALITY: ${WYZE_BRIDGE_QUALITY:-2}
+      FILTER_MODES: GW_
+    volumes:
+      - ./wyze-bridge:/config
+
+  # =========================================
+  # wyze-gwell-bridge — GW-based Wyze cameras
+  # (OG, Doorbell Pro, etc)
+  # =========================================
+  mediamtx:
+    image: bluenviron/mediamtx:latest-ffmpeg
+    container_name: mediamtx
+    restart: unless-stopped
+    networks:
+      lan:
+        ipv4_address: ${MEDIAMTX_IP:-10.10.20.208}
+      internal:
+
+  wyze-api:
+    build: ./wyze-api
+    container_name: wyze-api
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    env_file: .env
+    environment:
+      - MEDIAMTX_HOST=${MEDIAMTX_IP:-10.10.20.208}
+    networks:
+      lan:
+        ipv4_address: ${API_IP:-10.10.20.209}
+      internal:
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  wyze-p2p:
+    build: ./wyze-p2p
+    container_name: wyze-p2p
+    restart: unless-stopped
+    depends_on:
+      wyze-api:
+        condition: service_healthy
+    networks:
+      lan:
+        ipv4_address: ${P2P_IP:-10.10.20.212}
+      internal:
+    environment:
+      - CRYZE_API_URL=http://wyze-api:8080
+      - MEDIAMTX_HOST=${MEDIAMTX_IP:-10.10.20.208}
+      - MEDIAMTX_PORT=8554

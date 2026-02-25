@@ -1,0 +1,54 @@
+networks:
+  lan:
+    driver: macvlan
+    driver_opts:
+      parent: ${LAN_INTERFACE:-eth0}
+    ipam:
+      config:
+        - subnet: ${LAN_SUBNET:-10.10.0.0/16}
+          gateway: ${LAN_GATEWAY:-10.10.0.1}
+  internal:
+    driver: bridge
+
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:latest-ffmpeg
+    restart: unless-stopped
+    networks:
+      lan:
+        ipv4_address: ${MEDIAMTX_IP}
+      internal:
+
+  wyze-api:
+    build: ./wyze-api
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+    env_file: .env
+    environment:
+      - MEDIAMTX_HOST=${MEDIAMTX_IP}
+    networks:
+      lan:
+        ipv4_address: ${API_IP}
+      internal:
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  wyze-p2p:
+    build: ./wyze-p2p
+    restart: unless-stopped
+    depends_on:
+      wyze-api:
+        condition: service_healthy
+    networks:
+      lan:
+        ipv4_address: ${P2P_IP}
+      internal:
+    environment:
+      - CRYZE_API_URL=http://wyze-api:8080
+      - MEDIAMTX_HOST=${MEDIAMTX_IP}
+      - MEDIAMTX_PORT=8554
