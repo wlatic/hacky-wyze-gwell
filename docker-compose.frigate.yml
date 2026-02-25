@@ -18,9 +18,9 @@ networks:
       parent: ${LAN_INTERFACE:-ens18}
     ipam:
       config:
-        - subnet: ${LAN_SUBNET:-10.10.0.0/16}
-          gateway: ${LAN_GATEWAY:-10.10.0.1}
-          ip_range: ${LAN_IP_RANGE:-10.10.20.208/29}
+        - subnet: ${LAN_SUBNET:-192.168.1.0/24}
+          gateway: ${LAN_GATEWAY:-192.168.1.1}
+          ip_range: ${LAN_IP_RANGE:-192.168.1.200/29}
   internal:
     driver: bridge
 
@@ -34,7 +34,7 @@ services:
     restart: unless-stopped
     networks:
       lan:
-        ipv4_address: ${FRIGATE_IP:-10.10.20.210}
+        ipv4_address: ${FRIGATE_IP:-192.168.1.202}
     volumes:
       - ./frigate/config:/config
       - ./frigate/storage:/media/frigate
@@ -62,7 +62,7 @@ services:
     restart: unless-stopped
     networks:
       lan:
-        ipv4_address: ${WYZE_BRIDGE_IP:-10.10.20.211}
+        ipv4_address: ${WYZE_BRIDGE_IP:-192.168.1.203}
     environment:
       WB_AUTH: "false"
       WYZE_EMAIL: ${WYZE_EMAIL}
@@ -84,7 +84,7 @@ services:
     restart: unless-stopped
     networks:
       lan:
-        ipv4_address: ${MEDIAMTX_IP:-10.10.20.208}
+        ipv4_address: ${MEDIAMTX_IP:-192.168.1.200}
       internal:
 
   wyze-api:
@@ -95,10 +95,10 @@ services:
       - ./data:/app/data
     env_file: .env
     environment:
-      - MEDIAMTX_HOST=${MEDIAMTX_IP:-10.10.20.208}
+      - MEDIAMTX_HOST=${MEDIAMTX_IP:-192.168.1.200}
     networks:
       lan:
-        ipv4_address: ${API_IP:-10.10.20.209}
+        ipv4_address: ${API_IP:-192.168.1.201}
       internal:
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
@@ -116,9 +116,9 @@ services:
         condition: service_healthy
     networks:
       lan:
-        ipv4_address: ${P2P_IP:-10.10.20.212}
+        ipv4_address: ${P2P_IP:-192.168.1.204}
       internal:
     environment:
       - CRYZE_API_URL=http://wyze-api:8080
-      - MEDIAMTX_HOST=${MEDIAMTX_IP:-10.10.20.208}
+      - MEDIAMTX_HOST=${MEDIAMTX_IP:-192.168.1.200}
       - MEDIAMTX_PORT=8554

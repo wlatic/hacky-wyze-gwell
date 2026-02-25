@@ -157,6 +157,7 @@ type Session struct {
 	streamDataBytes int
 	lastDataFrom    string
 	bestLanAddr     *net.UDPAddr // best LAN address for KCP output (camera's actual IP:port)
+	meterRound      uint32       // per-session meter probe round counter
 
 	// Lifecycle
 	state  SessionState
@@ -1335,6 +1336,7 @@ func (s *Session) streamLoop() error {
 	lastHeartbeat := time.Now()
 	lastStatus := time.Now()
 	lastOnlineSocket := time.Now()
+	lastMeterProbe := time.Now()
 
 	for !s.isClosed() {
 		// Heartbeat every 5 seconds
@@ -1344,19 +1346,29 @@ func (s *Session) streamLoop() error {
 			lastHeartbeat = time.Now()
 		}
 
-		// Online socket keepalive every 10 seconds — tells camera we're still alive
-		// SDK: gat_send_online_socket @ 0x148d74 sends 0xCA sub_type=3 periodically
-		// Only send to camera LAN, NOT to P2P server (server can't handle this)
+		// Meter probe every 2 seconds — keeps camera session alive
+		// SDK: iv_mtpSession_send_meter_proc sends these periodically.
+		// Camera kills session if no meter probes arrive for ~119 seconds.
+		if time.Since(lastMeterProbe) > 2*time.Second {
+			s.meterRound++
+			probe := BuildMeterProbe(s.linkID, token.AccessID, s.targetDev.TID, s.meterRound)
+			probeFrame := BuildMTPFrame(probe, true)
+			s.sendMTP(probeFrame)
+			if s.meterRound == 1 {
+				log.Printf("%s METER PROBE hex (68 bytes): %x", s.prefix, probe)
+			}
+			if s.meterRound%15 == 0 {
+				log.Printf("%s meter probe round=%d", s.prefix, s.meterRound)
+			}
+			lastMeterProbe = time.Now()
+		}
+
+		// Online socket keepalive every 10 seconds — tells P2P server we're still alive
+		// SDK: gat_send_online_socket @ 0x148d74 sends 0xCA sub_type=3 to P2P server (param_1+0x5c)
 		if time.Since(lastOnlineSocket) > 10*time.Second {
 			keepalive := BuildSessionSocket(token, s.routingSessionID, s.nextSqnum(),
 				s.linkID, s.targetDev.TID, 3, nil, s.pwdKey)
-			if s.bestLanAddr != nil {
-				pc.WriteToUDP(keepalive, s.bestLanAddr)
-			} else {
-				for _, addr := range s.lanMTPAddrs {
-					pc.WriteToUDP(keepalive, addr)
-				}
-			}
+			pc.WriteToUDP(keepalive, s.serverUDPAddr)
 			lastOnlineSocket = time.Now()
 		}
 
@@ -1397,6 +1409,21 @@ func (s *Session) streamLoop() error {
 				}
 			}
 
+			// Log incoming meter/session control frames for diagnostics
+			{
+				diagOff := MTPPayloadOffset(buf[1])
+				if n >= diagOff+4 && buf[diagOff] == 0x00 {
+					mCmd := buf[diagOff+1]
+					if mCmd == 0x01 {
+						log.Printf("%s INCOMING meter REQUEST from %s: %d bytes, first20=%x",
+							s.prefix, fromAddr, n, buf[diagOff:minInt(diagOff+20, n)])
+					} else if mCmd == 0x02 {
+						log.Printf("%s INCOMING meter ACK from %s: %d bytes, first20=%x",
+							s.prefix, fromAddr, n, buf[diagOff:minInt(diagOff+20, n)])
+					}
+				}
+			}
+
 			// Feed MTP to KCP
 			sessCmd := FeedMTPToKCP(buf, n, s.dataKCP, s.ctrlKCP, s.convData, s.convCtrl)
 
@@ -1428,9 +1455,10 @@ func (s *Session) streamLoop() error {
 				}
 			}
 
-			// Handle meter req
+			// Handle meter req — camera sent us a meter probe, we respond with ACK
 			if sessCmd == 0x10001 {
 				payOff := MTPPayloadOffset(buf[1])
+				log.Printf("%s sending meter ACK (camera requested) from=%s payOff=%d", s.prefix, fromAddr, payOff)
 				resp := BuildMeterAckFromRequest(buf[payOff:minInt(n, payOff+68)])
 				respFrame := BuildMTPFrame(resp, true)
 				if fromAddr != nil {

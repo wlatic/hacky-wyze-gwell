@@ -36,8 +36,8 @@ All three services get their own LAN IPs via macvlan. Adjust the subnet, gateway
 
 ```bash
 docker network create -d macvlan \
-  --subnet=10.10.0.0/16 \
-  --gateway=10.10.0.1 \
+  --subnet=192.168.1.0/24 \
+  --gateway=192.168.1.1 \
   -o parent=eth0 \
   directlan
 ```

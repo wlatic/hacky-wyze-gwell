@@ -5,7 +5,7 @@ Last updated: 2026-02-25
 ## What's Done (Complete and Working)
 
 ### 1. Full P2P Protocol in Pure Go
-Every phase of the GWell/IoTVideo P2P protocol is implemented and tested against a live Wyze camera (GW_DUO_80482C6DF336). No QEMU shim, no Android, no native ARM libraries — all reverse-engineered from Ghidra decompilation of libiotp2pav.so.
+Every phase of the GWell/IoTVideo P2P protocol is implemented and tested against live Wyze GW cameras. No QEMU shim, no Android, no native ARM libraries — all reverse-engineered from Ghidra decompilation of libiotp2pav.so.
 
 ### 2. Crypto (pkg/gwell/rc5.go, xor.go, hash.go)
 - **RC5-32/6** — 8-byte block encryption/decryption (for frame encryption, AV data)
@@ -211,32 +211,21 @@ Solution implemented in `gwell-proxy/main.go`:
 ## Build Commands
 
 ```bash
-# Build gwell-proxy (production)
-cd /mnt/zfs/claude/system/projects/cryze_v2-main
-sudo docker run --rm -v $(pwd)/native_p2p_go:/src -w /src golang:1.21-alpine \
-  go build -o /src/gwell-proxy ./cmd/gwell-proxy/
-
-# Build certify_probe (test tool)
-sudo docker run --rm -v $(pwd)/native_p2p_go:/src -w /src golang:1.21-alpine \
-  go build -o /src/certify_probe_bin ./cmd/certify_probe/
+# Build via Docker compose (recommended)
+docker compose build
+docker compose up -d
 
 # Run unit tests
-sudo docker run --rm -v $(pwd)/native_p2p_go:/src -w /src golang:1.21-alpine \
+sudo docker run --rm -v $(pwd)/wyze-p2p:/src -w /src golang:1.21-alpine \
   go test ./pkg/gwell/ -v
 
-# Build Docker image (production)
-docker compose build native_p2p
-
-# Run full stack
-docker compose up
-
 # Run certify_probe standalone (test with live camera)
-TOKEN_JSON=$(curl -s 'http://localhost:8080/Camera/CameraToken?deviceId=GW_DUO_80482C6DF336') && \
+TOKEN_JSON=$(curl -s 'http://localhost:8080/Camera/CameraToken?deviceId=GW_YOUR_CAMERA_ID') && \
   ACCESS_ID=$(echo "$TOKEN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['accessId'])") && \
   ACCESS_TOKEN=$(echo "$TOKEN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['accessToken'])") && \
-  sudo docker run --rm --network cryze_lan --ip 10.10.20.210 \
+  sudo docker run --rm --network directlan --ip 192.168.1.204 \
     -v $(pwd)/native_p2p_go:/src alpine \
-    /src/certify_probe_bin -id "$ACCESS_ID" -token "$ACCESS_TOKEN" -lanip 10.10.102.163
+    /src/certify_probe_bin -id "$ACCESS_ID" -token "$ACCESS_TOKEN" -lanip 192.168.1.100
 ```
 
 ## Ghidra References
@@ -255,5 +244,4 @@ Key SDK functions decompiled and implemented:
 | iv_gutes_start_active_certify_req | 0x134864 | CertifyReq frame construction |
 | iv_gute_frm_rc5_encrypt | 0x12ef0c | Frame encryption mode dispatch |
 
-Ghidra project: `/tmp/ghidra_project_cmdfrm/cmdfrm_project` (may need recreation)
-Ghidra binary: `/mnt/zfs/claude/ghidra_11.3.1_PUBLIC`
+Ghidra binary: libiotp2pav.so (ARM64, from Wyze Cam OG firmware)

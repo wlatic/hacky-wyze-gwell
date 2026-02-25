@@ -456,7 +456,7 @@ func TestBuildNetworkDetectProbe(t *testing.T) {
 	dstID := uint64(0x0000AABBCCDDEEFF)
 	pwdKey := NewPasswordKey()
 
-	frame := BuildNetworkDetectProbe(token, routingSessionID, 42, dstID, pwdKey, "10.10.102.163", 5, 3000)
+	frame := BuildNetworkDetectProbe(token, routingSessionID, 42, dstID, pwdKey, "192.168.1.100", 5, 3000)
 
 	// Verify total size = 0xD0 = 208 bytes
 	if len(frame) != 208 {
@@ -544,10 +544,10 @@ func TestBuildNetworkDetectProbe(t *testing.T) {
 		t.Errorf("probeCount: got %d, want 5", probeCount)
 	}
 
-	// [80:] = IP string "10.10.102.163"
+	// [80:] = IP string "192.168.1.100"
 	ipStr := string(frame[80:93]) // 13 chars
-	if ipStr != "10.10.102.163" {
-		t.Errorf("IP string: got %q, want %q", ipStr, "10.10.102.163")
+	if ipStr != "192.168.1.100" {
+		t.Errorf("IP string: got %q, want %q", ipStr, "192.168.1.100")
 	}
 	// Null-terminated
 	if frame[93] != 0 {

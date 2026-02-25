@@ -109,6 +109,22 @@ func BuildMeterAckFromRequest(reqPayload []byte) []byte {
 	return ack
 }
 
+// BuildMeterProbe builds a meter PROBE (cmd=0x01) initiated by us.
+// SDK: iv_mtpSession_send_meter_proc sends these every 2s to keep the session alive.
+// The camera kills the session if no meter probes arrive for ~119 seconds.
+func BuildMeterProbe(linkID uint32, srcID uint64, dstID uint64, round uint32) []byte {
+	probe := make([]byte, 68)
+	probe[0] = 0x00
+	probe[1] = 0x01 // meter request/probe
+	binary.LittleEndian.PutUint16(probe[2:4], 0x0044) // length = 68
+	binary.LittleEndian.PutUint32(probe[4:8], linkID)
+	binary.LittleEndian.PutUint64(probe[12:20], srcID)
+	binary.LittleEndian.PutUint64(probe[20:28], dstID)
+	binary.LittleEndian.PutUint32(probe[28:32], round)
+	binary.LittleEndian.PutUint64(probe[36:44], uint64(time.Now().UnixMilli()))
+	return probe
+}
+
 // BuildKCPPushSegment builds a KCP push (cmd=81) segment with the given data.
 func BuildKCPPushSegment(conv uint32, sn uint32, ts uint32, data []byte) []byte {
 	seg := make([]byte, 24+len(data))

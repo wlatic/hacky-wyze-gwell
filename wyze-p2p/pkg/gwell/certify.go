@@ -579,7 +579,7 @@ func BuildSubscribeTokens(token *AccessToken, sessionID uint64, sqnum uint32, to
 // DeviceInfo holds a device's TID and name from InitInfoResp.
 type DeviceInfo struct {
 	TID  uint64 // 8-byte device TID (used as dst_id in CALLING)
-	Name string // Device name (e.g. "GW_DUO_80482C6DF336")
+	Name string // Device name (e.g. "GW_YOUR_CAMERA_ID")
 }
 
 // ParseInitInfoResp parses an InitInfoResp (0xA7) payload to extract device TID mappings.
