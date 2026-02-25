@@ -123,6 +123,10 @@ wyze-gwell-bridge/
 
 **Multiple cameras:** The P2P client automatically discovers and streams all GWell cameras on your account. There's a 15-second stagger between camera connections to avoid P2P server rate limiting.
 
+## Token caching
+
+After the first successful connection, the bridge caches P2P credentials locally (`data/token_cache.json`). Subsequent restarts reconnect to cameras without any Wyze cloud API calls. The cache is valid for 7 days — after that, a single API refresh happens automatically. This means streams survive container restarts, host reboots, and temporary internet outages.
+
 ## License
 
 MIT

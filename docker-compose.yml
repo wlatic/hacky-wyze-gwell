@@ -44,6 +44,9 @@ services:
     depends_on:
       wyze-api:
         condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    working_dir: /app
     networks:
       lan:
         ipv4_address: ${P2P_IP}

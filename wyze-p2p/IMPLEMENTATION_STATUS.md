@@ -239,6 +239,21 @@ A sub-second network hiccup was causing a 40+ second outage (reconnect time incl
 
 **Fix:** Changed heartbeat interval from 5s to 40s.
 
+### Token Caching (Zero-Cloud Restarts)
+
+**What was implemented:** Token, TID, and P2P server address caching to `data/token_cache.json`.
+
+**How it works:**
+- On first start, the bridge fetches credentials from the Wyze cloud API (via `wyze-api`) and caches them locally
+- On subsequent restarts, the bridge loads credentials from the cache file — zero API calls needed
+- The cache stores: access tokens, TIDs, and the resolved P2P server address
+
+**Cache validity:** 7 days, matching the requested TTL from Wyze Mars. After expiry, a fresh API fetch is triggered automatically.
+
+**Fallback:** If a cached token fails during P2P server certify (e.g., token was revoked server-side), the bridge falls back to a fresh API fetch, re-caches the new credentials, and retries the connection.
+
+**Result:** The Wyze cloud API is only needed once per week. Streams survive container restarts, host reboots, and temporary internet outages without needing to re-authenticate.
+
 ### Nice to Have
 - [ ] Fix pre-existing `TestBuildInitInfoMsg` test failure (encryption mode mismatch — cosmetic)
 - [ ] Token refresh mid-session (currently `_ = newToken` placeholder)
