@@ -119,7 +119,7 @@ wyze-gwell-bridge/
 
 **No video:** Verify the camera LAN IP is correct and reachable from the P2P container. The camera must be on the same network.
 
-**Stream dies after a few seconds:** This is usually a KCP ACK delivery issue. Check `docker compose logs wyze-p2p` for timeout errors. Restart with `docker compose restart wyze-p2p`.
+**Stream dies after a few minutes:** Earlier versions had several issues causing streams to drop after 3–7 minutes. These have all been resolved — see the "Stream Stability" section in `wyze-p2p/IMPLEMENTATION_STATUS.md` for details. If you still see drops, check `docker compose logs wyze-p2p` for `dropAhead` counts or watchdog timeout messages.
 
 **Multiple cameras:** The P2P client automatically discovers and streams all GWell cameras on your account. There's a 15-second stagger between camera connections to avoid P2P server rate limiting.
 

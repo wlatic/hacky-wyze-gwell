@@ -49,9 +49,9 @@ Phase 7: streamLoop()  — Create dual KCP sessions (DATA + CTRL),
 ### 5. KCP Transport (pkg/gwell/kcp.go)
 - Custom KCP implementation with SDK-matching parameters:
   - nodelay=0, interval=5ms, resend=10, nc=1 (no congestion control)
-  - window=64x64 (send/receive)
+  - window=64 send / 512 receive (~170ms buffer at video bitrate)
 - Dual KCP sessions: DATA (conv = linkID & 0x7FFFFFFF), CTRL (conv = linkID | 0x80000000)
-- Output function sends ACKs LAN-only, PUSHes to all paths (LAN + relay + server)
+- Output function sends to single camera LAN address only (matches SDK behavior)
 
 ### 6. H.264 Stream Extraction
 - **RC5 decryption** of AV data (type=0x04) from KCP receive queue
@@ -198,6 +198,47 @@ Solution implemented in `gwell-proxy/main.go`:
 - Sessions still send `InitInfoMsg` to get per-session routing ID (0x0D)
 - 15-second stagger between camera starts
 
+### Stream Stability Fixes (Resolved)
+
+Five fixes were required to achieve indefinite stream stability. The root causes were identified by decompiling the SDK (`libiotp2pav.so`) in Ghidra and comparing its behavior against our implementation.
+
+#### 1. KCP Output Target — Single LAN Address
+
+**Problem:** `kcpOutputFn` was sending every KCP frame to all known destinations — the P2P server, relay servers, and every discovered LAN address (8+). The SDK (`iv_mtp_session_send_rcv_proc`) only sends to a single resolved camera LAN address. The P2P server interprets unexpected KCP traffic as a misbehaving client and kills the session after ~3 minutes.
+
+**Fix:** Rewrote `kcpOutputFn` and `sendMTP` to send exclusively to `bestLanAddr` (the single confirmed camera LAN IP). Added filtering to exclude Docker bridge IPs (172.x.x.x) from the LAN address candidate list.
+
+#### 2. Meter Probe Keepalives — Proactive 2-Second Ticker
+
+**Problem:** The SDK function `iv_mtpSession_send_meter_proc` sends meter probe frames every 2000ms during an active stream. Our implementation only responded to incoming meter requests but never proactively initiated probes. Without bidirectional meter exchange, the camera's connection quality scoring degrades over time.
+
+**Fix:** Added `BuildMeterProbe()` frame builder and a 2-second `time.Ticker` in the streaming loop. Both sides now participate: the camera sends probes and we respond with ACKs; we send probes and the camera responds with ACKs. This keeps the MTP quality scoring system healthy.
+
+#### 3. 0xCA Keepalive Target — P2P Server, Not Camera
+
+**Problem:** The 0xCA online socket keepalive was being sent to camera LAN addresses. SDK decompilation showed this keepalive targets the P2P server address (stored at struct offset `+0x5c`), not the camera.
+
+**Fix:** Changed the 0xCA keepalive target from `bestLanAddr` to `serverUDPAddr`.
+
+#### 4. KCP Receive Window Size — The Key Fix
+
+**Problem:** KCP was configured with `SetWndSize(64, 64)` — a receive window of only 64 segments. At video bitrate (~3000 segments/sec), this provides only ~21ms of buffering. When a single UDP packet is lost:
+
+1. `rcvNxt` freezes at the lost segment's sequence number
+2. The 63 remaining receive buffer slots fill with out-of-order packets
+3. All subsequent packets are dropped as "too far ahead" (observed: 14,351 packets dropped in one incident)
+4. The stream appears dead, the 30-second watchdog fires, and a full reconnect occurs
+
+A sub-second network hiccup was causing a 40+ second outage (reconnect time included).
+
+**Fix:** Increased to `SetWndSize(64, 512)` — 511 receive segments provides ~170ms of buffering. Single lost packets are now absorbed while waiting for the camera's KCP retransmit. After this fix, `dropAhead=0` on all cameras and streams survive indefinitely.
+
+#### 5. P2P Server Heartbeat Interval
+
+**Problem:** Heartbeat to the P2P server was sent every 5 seconds. SDK decompilation showed the actual interval is 35–50 seconds. The aggressive heartbeat was unnecessary traffic.
+
+**Fix:** Changed heartbeat interval from 5s to 40s.
+
 ### Nice to Have
 - [ ] Fix pre-existing `TestBuildInitInfoMsg` test failure (encryption mode mismatch — cosmetic)
 - [ ] Token refresh mid-session (currently `_ = newToken` placeholder)
@@ -237,6 +278,7 @@ Key SDK functions decompiled and implemented:
 | iv_mtp_session_send_rcv_proc | 0x15db30 | Main 10ms loop (rcv, KCP update, send) |
 | iv_on_rcv_kcp_cmdfrm | 0x152b64 | Decrypts type=2 CMD frames |
 | iv_send_av_ringbuf | 0x15d6cc | RC5 encrypts AV data, sends via DATA KCP |
+| iv_mtpSession_send_meter_proc | — | Sends meter probe frames every 2000ms |
 | FUN_00164d60 | 0x164d60 | Builds 0xffffff88 head_info (28B) |
 | FUN_00165078 | 0x165078 | av_send_thread: head_info first, then encode |
 | giot_eif_subscribe_dev | 0x1769a4 | Builds 0xB0 subscribe frame |
