@@ -156,6 +156,7 @@ type Session struct {
 	streamPkts      int
 	streamDataBytes int
 	lastDataFrom    string
+	bestLanAddr     *net.UDPAddr // best LAN address for KCP output (camera's actual IP:port)
 
 	// Lifecycle
 	state  SessionState
@@ -982,24 +983,22 @@ func (s *Session) probeAndWait(callingRelayIP net.IP, callingRelayPort uint16,
 	}
 }
 
-// isPrivateIP returns true if the IP is a private/LAN address (RFC 1918 + link-local).
-func isPrivateIP(ip net.IP) bool {
+// isCameraLanIP returns true if the IP is on a real LAN subnet (10.0.0.0/8 or 192.168.0.0/16).
+// Docker bridge (172.16.0.0/12) is explicitly excluded — those IPs cannot reach the camera.
+func isCameraLanIP(ip net.IP) bool {
 	ip4 := ip.To4()
 	if ip4 == nil {
 		return false
 	}
-	// 10.0.0.0/8
+	// 10.0.0.0/8 — cameras are on 10.10.x.x
 	if ip4[0] == 10 {
-		return true
-	}
-	// 172.16.0.0/12
-	if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
 		return true
 	}
 	// 192.168.0.0/16
 	if ip4[0] == 192 && ip4[1] == 168 {
 		return true
 	}
+	// 172.16.0.0/12 is intentionally excluded (Docker bridge)
 	return false
 }
 
@@ -1009,7 +1008,7 @@ func (s *Session) addLanMTPAddr(addr *net.UDPAddr) {
 	if addr == nil {
 		return
 	}
-	if !isPrivateIP(addr.IP) {
+	if !isCameraLanIP(addr.IP) {
 		return
 	}
 	for _, a := range s.lanMTPAddrs {
@@ -1073,12 +1072,24 @@ func (s *Session) setupTransport(callingRelayIP net.IP, callingRelayPort uint16,
 	}
 }
 
-// sendMTP sends an MTP frame via all available transports.
+// sendMTP sends an MTP frame to the camera via the best available path.
+// Like kcpOutputFn, prefers LAN direct and avoids flooding the P2P server.
 func (s *Session) sendMTP(data []byte) {
-	token := s.cfg.Token
-	result := s.certResult
+	// If we have a confirmed best LAN address, use only that
+	if s.bestLanAddr != nil {
+		s.pc.WriteToUDP(data, s.bestLanAddr)
+		return
+	}
 
-	// TCP relay
+	// Send to all known camera LAN addresses (during initial setup/probing)
+	if len(s.lanMTPAddrs) > 0 {
+		for _, addr := range s.lanMTPAddrs {
+			s.pc.WriteToUDP(data, addr)
+		}
+		return
+	}
+
+	// Fallback: no LAN addresses, use relay paths
 	if s.tcpRelay != nil {
 		tcpData := make([]byte, len(data))
 		copy(tcpData, data)
@@ -1089,12 +1100,6 @@ func (s *Session) sendMTP(data []byte) {
 		s.tcpRelay.Write(tcpData)
 	}
 
-	// Direct LAN
-	for _, addr := range s.lanMTPAddrs {
-		s.pc.WriteToUDP(data, addr)
-	}
-
-	// Extended MTP relay
 	if len(data) > 6 && data[0] == 0xC0 {
 		payload := data[6:]
 		urgent := data[1]&0x80 != 0
@@ -1102,16 +1107,6 @@ func (s *Session) sendMTP(data []byte) {
 			extFrame := BuildExtendedMTPFrame(payload, s.targetDev.TID, urgent)
 			s.pc.WriteToUDP(extFrame, rt.Addr)
 		}
-	}
-
-	// P2P server
-	s.pc.WriteToUDP(data, s.serverUDPAddr)
-
-	// PASSTHROUGH DATA
-	if len(data) > 0 {
-		ptData := BuildPassthroughData(token, s.routingSessionID, s.nextSqnum(),
-			s.targetDev.TID, 0, data, result.SessionKey, s.pwdKey)
-		s.pc.WriteToUDP(ptData, s.serverUDPAddr)
 	}
 }
 
@@ -1141,26 +1136,33 @@ func (s *Session) streamLoop() error {
 	s.convCtrl = s.linkID | 0x80000000
 	log.Printf("%s KCP: data=0x%08X ctrl=0x%08X", s.prefix, s.convData, s.convCtrl)
 
-	// KCP output function — send via all available paths to keep relay alive
+	// KCP output function — SDK sends to ONE destination based on channel type.
+	// LAN (type 0x01): send ONLY to camera's LAN address.
+	// Sending to P2P server causes session death after ~3 minutes (server can't
+	// parse raw MTP frames, treats session as misbehaving).
 	kcpOutputFn := func(data []byte, size int) {
 		payload := data[:size]
 		stdFrame := BuildMTPFrame(payload, false)
 
-		// Send via all paths — ACKs must reach camera through relays too,
-		// otherwise the relay connection goes idle and gets dropped.
-		for _, addr := range s.lanMTPAddrs {
-			s.pc.WriteToUDP(stdFrame, addr)
+		// If we have a confirmed best LAN address (from received data), use only that
+		if s.bestLanAddr != nil {
+			s.pc.WriteToUDP(stdFrame, s.bestLanAddr)
+			return
 		}
+
+		// Otherwise send to all known camera LAN addresses (during initial probing)
+		if len(s.lanMTPAddrs) > 0 {
+			for _, addr := range s.lanMTPAddrs {
+				s.pc.WriteToUDP(stdFrame, addr)
+			}
+			return
+		}
+
+		// Fallback: no LAN addresses available, use relay paths
 		for _, rt := range s.udpRelayTargets {
 			extFrame := BuildExtendedMTPFrame(payload, s.targetDev.TID, false)
 			s.pc.WriteToUDP(extFrame, rt.Addr)
 		}
-		s.discoveredRelays.Range(func(key, value any) bool {
-			addr := value.(*net.UDPAddr)
-			extFrame := BuildExtendedMTPFrame(payload, s.targetDev.TID, false)
-			s.pc.WriteToUDP(extFrame, addr)
-			return true
-		})
 		if s.tcpRelay != nil {
 			tcpData := make([]byte, len(stdFrame))
 			copy(tcpData, stdFrame)
@@ -1169,7 +1171,6 @@ func (s *Session) streamLoop() error {
 			}
 			s.tcpRelay.Write(tcpData)
 		}
-		s.pc.WriteToUDP(stdFrame, s.serverUDPAddr)
 	}
 
 	s.dataKCP = NewKCPConn(s.convData, kcpOutputFn)
@@ -1260,6 +1261,11 @@ func (s *Session) streamLoop() error {
 						s.discoveredRelays.LoadOrStore(addrKey, newAddr)
 					} else {
 						s.addLanMTPAddr(fromAddr)
+						// Lock best LAN addr during INITREQ phase too
+						if isCameraLanIP(fromAddr.IP) && s.bestLanAddr == nil {
+							s.bestLanAddr = &net.UDPAddr{IP: append(net.IP(nil), fromAddr.IP...), Port: fromAddr.Port}
+							log.Printf("%s locked bestLanAddr: %s", s.prefix, s.bestLanAddr)
+						}
 					}
 				}
 
@@ -1340,20 +1346,24 @@ func (s *Session) streamLoop() error {
 
 		// Online socket keepalive every 10 seconds — tells camera we're still alive
 		// SDK: gat_send_online_socket @ 0x148d74 sends 0xCA sub_type=3 periodically
+		// Only send to camera LAN, NOT to P2P server (server can't handle this)
 		if time.Since(lastOnlineSocket) > 10*time.Second {
 			keepalive := BuildSessionSocket(token, s.routingSessionID, s.nextSqnum(),
 				s.linkID, s.targetDev.TID, 3, nil, s.pwdKey)
-			for _, addr := range s.lanMTPAddrs {
-				pc.WriteToUDP(keepalive, addr)
+			if s.bestLanAddr != nil {
+				pc.WriteToUDP(keepalive, s.bestLanAddr)
+			} else {
+				for _, addr := range s.lanMTPAddrs {
+					pc.WriteToUDP(keepalive, addr)
+				}
 			}
-			pc.WriteToUDP(keepalive, s.serverUDPAddr)
 			lastOnlineSocket = time.Now()
 		}
 
 		// Status log every 30 seconds
 		if time.Since(lastStatus) > 30*time.Second {
 			LogMTPStats(s.prefix, s.dataKCP, s.ctrlKCP, s.streamPkts, s.streamDataBytes)
-			log.Printf("%s LAN addrs: %d, last data from: %s", s.prefix, len(s.lanMTPAddrs), s.lastDataFrom)
+			log.Printf("%s LAN addrs: %d, bestLAN: %v, last data from: %s", s.prefix, len(s.lanMTPAddrs), s.bestLanAddr, s.lastDataFrom)
 			lastStatus = time.Now()
 		}
 
@@ -1369,7 +1379,7 @@ func (s *Session) streamLoop() error {
 
 		if buf[0] == 0xC0 {
 			s.lastDataFrom = fromAddr.String()
-			// Track source addresses
+			// Track source addresses and update best LAN addr
 			if !isFromServer && fromAddr != nil {
 				mtpFlags := buf[1]
 				if (mtpFlags>>5)&3 != 0 {
@@ -1378,6 +1388,12 @@ func (s *Session) streamLoop() error {
 					s.discoveredRelays.LoadOrStore(addrKey, newAddr)
 				} else {
 					s.addLanMTPAddr(fromAddr)
+					// Lock onto the LAN address that's actually sending us data
+					// SDK equivalent: mtpSession+0x5c (best addr from meter probing)
+					if isCameraLanIP(fromAddr.IP) && s.bestLanAddr == nil {
+						s.bestLanAddr = &net.UDPAddr{IP: append(net.IP(nil), fromAddr.IP...), Port: fromAddr.Port}
+						log.Printf("%s locked bestLanAddr: %s", s.prefix, s.bestLanAddr)
+					}
 				}
 			}
 
